@@ -405,6 +405,27 @@ public class EtlPipeline {
         return new ChunkUtils.ParentChildDocuments(parentBlocks, childDocuments);
     }
 
+    /**
+     * readAndSplit(ctx)
+     *     │
+     *     ├─ transitionTo(SPLITTING)                       状态：切分中
+     *     │
+     *     ├─ strategy / genericReadAndSplit                 抽取 + 切分
+     *     │       └─ buildFixedWindowParentChildDocuments   父块 + 子块（带切分元数据）
+     *     │
+     *     ├─ loadDocumentByDocUuid(docUuid)                 回查数据库文档记录
+     *     │       │
+     *     │       └─ .map(storedDoc -> enrichMetadata(...))  ← 本方法：注入业务元数据
+     *     │
+     *     └─ doOnNext(log)
+     * 分块结果注入完整元数据
+     * 这是 readAndSplit 里切分之后的收尾步骤，把「ETL 上下文 + 分块结果 + 数据库文档记录」三方信息融合，
+     * 给每个父块和子块补上业务元数据（归属、权限、标签、版本等）。它是写入向量库前的最后一次"打标"。
+     * @param etlContext 上下文：docUuid、fileName、tags
+     * @param docs 切分产物：父块 + 子块
+     * @param storedDocument 数据库记录
+     * @return
+     */
     private ChunkUtils.ParentChildDocuments enrichMetadata(EtlContext etlContext,
                                                            ChunkUtils.ParentChildDocuments docs,
                                                            net.topikachu.rag.business.document.entity.Document storedDocument) {
@@ -412,15 +433,22 @@ public class EtlPipeline {
         if (storedDocument != null && storedDocument.getTags() != null) {
             effectiveTags = storedDocument.getTags();
         }
+
+        // 给父块打标
+        // 是业务实体（KnowledgeParentBlock），有明确的 setter，逐个字段赋值。
         for (KnowledgeParentBlock parentBlock : docs.parentBlocks()) {
-            parentBlock.setDocUuid(etlContext.docUuid());
-            parentBlock.setFileName(etlContext.fileName());
-            parentBlock.setSpaceCode(resolveSpaceCode(storedDocument));
-            parentBlock.setTags(effectiveTags == null ? List.of() : List.copyOf(effectiveTags));
-            parentBlock.setAclVersion(storedDocument == null ? 1 : storedDocument.getAclVersion());
-            parentBlock.setChunkSchemaVersion(KnowledgeParentBlockService.CHUNK_SCHEMA_VERSION);
+            parentBlock.setDocUuid(etlContext.docUuid()); // 归属文档
+            parentBlock.setFileName(etlContext.fileName()); // 来源文件名（展示用）
+            parentBlock.setSpaceCode(resolveSpaceCode(storedDocument)); // 知识空间编码（多租户/分类隔离）
+            parentBlock.setTags(effectiveTags == null ? List.of() : List.copyOf(effectiveTags)); // 业务标签，List.copyOf(effectiveTags)：生成不可变副本，防止外部后续修改 effectiveTags 影响已入库的块。这是防御性拷贝
+            parentBlock.setAclVersion(storedDocument == null ? 1 : storedDocument.getAclVersion()); // 权限版本号（访问控制）
+            parentBlock.setChunkSchemaVersion(KnowledgeParentBlockService.CHUNK_SCHEMA_VERSION); // 分块 schema 版本
         }
+
+        // 给子块打标（关键差异）
+        // 子块：是 Spring AI 的 Document，元数据是 Map<String, Object>，没有强类型字段，所以用 Map 操作。
         for (Document child : docs.childDocuments()) {
+            // 一个专门的构建器，把三方信息（storedDocument、docUuid、fileName、tags、原有 metadata、aclVersion）统一组装成一份全新的元数据 Map
             Map<String, Object> rebuiltMetadata = metadataBuilder.build(
                     storedDocument,
                     etlContext.docUuid,
@@ -428,8 +456,8 @@ public class EtlPipeline {
                     effectiveTags,
                     child.getMetadata(),
                     storedDocument == null ? 1 : storedDocument.getAclVersion());
-            child.getMetadata().clear();
-            child.getMetadata().putAll(rebuiltMetadata);
+            child.getMetadata().clear(); // 清空原 metadata。
+            child.getMetadata().putAll(rebuiltMetadata); // 填入重建后的。
         }
         return docs;
     }
@@ -442,17 +470,36 @@ public class EtlPipeline {
         return storedDocument.getSpaceCode().trim();
     }
 
+    /**
+     * writeParentBlocksAndVectors — ETL 的第二阶段（Load）
+     * 这是整条 ETL 流水线的第二个 stage，对应前面讲的 Load（加载）。它负责：更新状态 → 写 MySQL 父块 → 写 Milvus 子向量，顺序严格不能颠倒
+     * @param ctx 上下文 ctx
+     * @param parentChildDocs 上一阶段切分好的 parentChildDocs（父块 + 子块）
+     * @return Mono<Void> —— 只关心"完成/失败"信号，不产生数据
+     */
     private Mono<Void> writeParentBlocksAndVectors(EtlContext ctx, ChunkUtils.ParentChildDocuments parentChildDocs) {
+        // 构建 trace 标签, 生成带新标签的副本，不污染原 traceTags
+        // 为什么要带上数量？
+        // 在链路追踪系统里，一眼能看到这次处理了多少块。如果数量异常（比如 0 或 10000），能快速定位问题。这是"可观测性数据即业务数据"的实践
         Map<String, Object> traceTags = ctx.tagsWith(Map.of(
-                "etl.stage", "vectorize",
-                "etl.parent_block_count", parentChildDocs.parentBlocks().size(),
-                "etl.chunk_count", parentChildDocs.childDocuments().size()
+                "etl.stage", "vectorize", // 标明当前阶段；
+                "etl.parent_block_count", parentChildDocs.parentBlocks().size(), // 父块数量
+                "etl.chunk_count", parentChildDocs.childDocuments().size() // 子块数量
         ));
         return tracingSupport.traceMono("etl.vectorize", traceTags,
-                etlStatusManager.transitionTo(ctx.docUuid, ctx.userId, DocumentStatus.VECTORIZING, "Writing to Vector Store...")
+                // 把文档状态从 SPLITTING 转为 VECTORIZING，附带文案"Writing to Vector Store..."。
+                // 用户在前端能看到进度从"切分中"变成"向量化中"。
+                etlStatusManager.transitionTo(ctx.docUuid, ctx.userId, DocumentStatus.VECTORIZING, "Writing to Vector Store...") // ① 状态机
                         // 先写 MySQL 父块，再写 Milvus 子向量：子块通过 parent_block_id 引用父块，顺序不能颠倒
+                        // 调用 replaceForDocument：替换该文档的所有父块。
+                        //方法名里的 "replace" 很关键——它不是"append"，而是先删后插或幂等替换。这保证了：
+                        //重跑安全：文档重新处理时不会产生重复父块；
+                        //一致性：一次处理对应一份完整的父块集合
+                        //为什么父块要写 MySQL？
+                        //父块是较大的文本单元，用于给 LLM 提供上下文，不需要向量检索（检索靠子块）。
+                        //存在关系库里便于按 parent_block_id 快速回查、做业务查询、管理。
                         .then(parentBlockService.replaceForDocument(ctx.docUuid(), parentChildDocs.parentBlocks()))
-                        .then(Mono.defer(() -> {
+                        .then(Mono.defer(() -> { // Mono.defer 把内部的逻辑推迟到订阅时才执行
                             // 空文档（如全图片 PDF 无文字）跳过 Milvus 写入，否则会报参数错误
                             if (!parentChildDocs.childDocuments().isEmpty()) {
                                 return hybridVectorWriter.write(parentChildDocs.childDocuments());
@@ -461,57 +508,173 @@ public class EtlPipeline {
                         })));
     }
 
+    /**
+     * genericReadAndSplit(ctx)
+     *     ├─ new TikaDocumentReader(...).get()          抽取原始文本
+     *     ├─ sanitizeDocuments(path, docs)              ← 本方法：清洗 + 过滤
+     *     │       └─ 逐文档：sanitize → 日志 → 丢弃空 → 构造新 Document
+     *     ├─ if (docs.isEmpty()) throw ...              全空则失败
+     *     └─ buildFixedWindowParentChildDocuments(...)  切分
+     * 文本清洗与低质量过滤
+     * 这是 genericReadAndSplit 里 Tika 抽取之后的清洗步骤，负责对每个抽取出的 Document 做文本净化、质量检测、空内容丢弃，并保留元数据。
+     * 它是 ETL 里 Transform（转换） 的细粒度体现
+     * @param path 文件路径
+     * @param docs  抽取的原始文档列表
+     * @return 清洗后的新列表（可能比输入少，因为空文档被丢弃）
+     */
     private List<Document> sanitizeDocuments(Path path, List<Document> docs) {
         List<Document> sanitizedDocs = new ArrayList<>();
         for (Document doc : docs) {
+            // ① 调用 TextSanitizer 清洗，拿到结构化结果
             TextSanitizer.SanitizationResult result = TextSanitizer.sanitize(doc.getText());
+            // ② 确定日志用的来源标签（页码 or 通用）
             Object pageNumber = doc.getMetadata().get("page_number");
+            // 目的：让日志能精确定位是哪一页/哪一段出了问题，而不是笼统地说"这个文件有问题"。
             String sourceLabel = pageNumber != null ? "page " + pageNumber : "document chunk";
+            // ③ 若被修改 → INFO 日志
+            // ④ 若低质量 → WARN 日志
+            // ⑤ 若实际为空 → 丢弃（continue）
+            // ⑥ 否则 → 用清洗后文本 + 复制元数据构造新 Document
 
-            if (result.wasModified()) {
+            // 只要清洗改动了文本，就打 INFO 日志。
+            // 记录：移除了多少字符、是否规范化空白、原始长度、清洗后长度。
+            // 用途：可观测性——知道清洗器实际做了什么，便于调参（比如发现某类文件总被移除大量字符）。
+            if (result.wasModified()) { // 文本被清洗改动过
                 log.info("Sanitized {} from {}: removedChars={}, normalizedWhitespace={}, originalLength={}, sanitizedLength={}",
                         sourceLabel, path.getFileName(), result.removedChars(), result.normalizedWhitespace(),
                         result.originalLength(), result.text().length());
             }
-            if (result.isLowQualityExtraction()) {
+
+            // 如果抽取质量低（比如移除比例过高、有效码点太少），打 WARN。
+            // 这不丢弃文档，只是告警——留给运维/开发者观察。
+            // 典型场景：扫描版 PDF 经 OCR 后全是乱码、加密文档抽出乱字符、损坏文件。
+            // 用 meaningfulCodePoints（有效 Unicode 码点）而非 length 判断，能正确识别emoji、中文、组合字符等的"真实信息量"。
+            if (result.isLowQualityExtraction()) { // 抽取质量差（乱码多等）
                 log.warn("Low-quality {} extraction for {}: removedRatio={}, meaningfulCodePoints={}",
                         sourceLabel, path.getFileName(), result.removedRatioPercent(), result.meaningfulCodePoints());
             }
-            if (result.isEffectivelyEmpty()) {
+
+            // "effectively empty" 比 isEmpty() 更严格——清洗后可能剩一些空白/不可见字符，语义上仍是空。
+            // 满足则 continue 跳过，不加入结果列表。
+            // 打 WARN 而非 INFO，因为"有内容却清洗后为空"是值得注意的现象。
+            // 这一步保证了后续 buildFixedWindowParentChildDocuments 拿到的都是有实际内容的文档。
+            if (result.isEffectivelyEmpty()) { // 清洗后实际为空
                 log.warn("Dropping {} from {} after sanitization", sourceLabel, path.getFileName());
                 continue;
             }
+
+            // 构造新 Document,new HashMap<>(doc.getMetadata()) 是关键：防御性拷贝
+            // 不复用原 Map，避免后续修改污染原文档；
+            // 不复用原 Document，保证下游拿到的是"干净的"对象。
             sanitizedDocs.add(new Document(result.text(), new HashMap<>(doc.getMetadata())));
         }
         return sanitizedDocs;
     }
 
-    // 补偿清理：先删父块（MySQL），再标记 FAILED；即使删块失败也会继续更新状态，避免卡在中间态
+    /**
+     * 失败兜底与补偿清理
+     * 补偿清理：先删父块（MySQL），再标记 FAILED；即使删块失败也会继续更新状态，避免卡在中间态
+     * 这是整条 ETL 流水线的错误处理终点，由 ingestionByPath 的 .onErrorResume(e -> failAndCleanup(ctx, e)) 触发。
+     * 它负责：记录错误 → 清理脏数据 → 更新失败状态 → 重新抛出异常。对应前面提到的 Saga 补偿模式。
+     *
+     * 整条 ETL 是跨 MySQL + Milvus 的分布式操作，没有分布式事务。失败时靠补偿清理实现最终一致性：
+     * 正常流程（正向）：
+     *   transitionTo(SPLITTING) → 切分 → enrichMetadata
+     *   → transitionTo(VECTORIZING) → 写 MySQL 父块 → 写 Milvus 子向量
+     *   → completeStatus(成功)
+     *
+     * 失败流程（补偿）：
+     *   failAndCleanup：
+     *     删 MySQL 父块  → transitionToFailed → 抛出
+     * @param ctx 上下文 ctx
+     * @param error  触发的异常 error
+     * @return 它返回错误信号（重新抛异常），而不是"吞掉错误后正常完成"
+     */
     private Mono<Void> failAndCleanup(EtlContext ctx, Throwable error) {
         log.error("Error during ingestionByPath: {}", ctx.path, error);
 
         Map<String, Object> extra = new LinkedHashMap<>();
-        extra.put("etl.stage", "failed");
-        extra.put("error.type", error == null ? "" : error.getClass().getSimpleName());
-        extra.put("error.message", extractUserMessage(error));
-        return tracingSupport.traceMono("etl.fail_cleanup", ctx.tagsWith(extra),
-                parentBlockService.deleteByDocUuid(ctx.docUuid())
-                        .then(etlStatusManager.transitionToFailed(ctx.docUuid(), ctx.userId(), error))
-                        .then(Mono.error(error)));
+        extra.put("etl.stage", "failed"); // 标明失败阶段
+        extra.put("error.type", error == null ? "" : error.getClass().getSimpleName()); // 便于按类型聚合分析
+        extra.put("error.message", extractUserMessage(error)); // 用户可读的错误信息
+
+        // 顺序很讲究：先清理 → 再标记失败 → 最后把异常继续往下传。
+        // tracingSupport.traceMono("etl.fail_cleanup", ctx.tagsWith(extra), ...) 给整个失败清理流程包一个 span，名叫 "etl.fail_cleanup"。
+        return tracingSupport.traceMono("etl.fail_cleanup", ctx.tagsWith(extra), // tracingSupport.traceMono("etl.fail_cleanup", ctx.tagsWith(extra), ...)
+                parentBlockService.deleteByDocUuid(ctx.docUuid()) // ① 清理父块
+                        .onErrorResume(cleanupErr -> {
+                            log.warn("Cleanup failed", cleanupErr);
+                            return Mono.empty();   // 清理失败不阻断状态更新
+                        })
+                        .then(etlStatusManager.transitionToFailed(ctx.docUuid(), ctx.userId(), error)) // ② 置失败状态
+                        .then(Mono.error(error))); // ③ 重新抛出
     }
 
+    /**
+     * ingestionByPath
+     *     │
+     *     ├─ readAndSplit(ctx)                        状态: → SPLITTING
+     *     ├─ writeParentBlocksAndVectors(ctx, docs)   状态: → VECTORIZING
+     *     │                                              写 MySQL 父块 + Milvus 向量
+     *     ├─ completeStatus(ctx)                      ← 本方法：状态 → COMPLETED
+     *     │
+     *     ├─ doOnSuccess(log "finished")
+     *     └─ onErrorResume → failAndCleanup           状态 → FAILED + 清理
+     *
+     *  把前面所有阶段串起来看，DocumentStatus 的流转：
+     * PENDING / UPLOADED
+     *         │  transitionTo(SPLITTING)
+     *         ▼
+     *     SPLITTING ──────────────┐
+     *         │  transitionTo(VECTORIZING)
+     *         ▼                   │
+     *    VECTORIZING ─────────────┤
+     *         │                   │
+     *         ├── 成功 ──────────►│
+     *         │   transitionToCompleted()
+     *         ▼                   │
+     *     COMPLETED               │
+     *                             │
+     *         ┌── 失败（任意阶段）─┘
+     *         │   transitionToFailed()
+     *         ▼
+     *      FAILED
+     * @param ctx 上下文 ctx。
+     * @return  只关心"完成/失败"信号。
+     */
     private Mono<Void> completeStatus(EtlContext ctx) {
-        return tracingSupport.traceMono("etl.finish",
-                ctx.tagsWith("etl.stage", "finish"),
-                etlStatusManager.transitionToCompleted(ctx.docUuid(), ctx.userId()));
+        // 目的：让"成功收尾"这一步在链路追踪里独立可见，能看到它的耗时和结果。
+        return tracingSupport.traceMono("etl.finish", // span 名字
+                ctx.tagsWith("etl.stage", "finish"), // span 标签
+                etlStatusManager.transitionToCompleted(ctx.docUuid(), ctx.userId()));  // 被包裹的业务
     }
 
+    /**
+     * 构建链路追踪的基础标签
+     * 初始（etlTraceTags）:
+     *   document.doc_uuid, document.file_name, document.user_id, document.tags
+     *         │
+     *         ├─ of() 追加: document.file_ext
+     *         │
+     *         ├─ readAndSplit 追加: etl.stage=read_split
+     *         ├─ writeParentBlocksAndVectors 追加: etl.stage=vectorize, etl.parent_block_count, etl.chunk_count
+     *         ├─ completeStatus 追加: etl.stage=finish
+     *         └─ failAndCleanup 追加: etl.stage=failed, error.type, error.message
+     * 这是 EtlContext.of(...) 里调用的私有工具方法，负责从原始参数组装一份初始的追踪标签 Map。它是整个 ETL 可观测性的"起点"。
+     * @param path 路径
+     * @param docUuid 文档 UUID
+     * @param userId 用户 ID
+     * @param tags 标签
+     * @return 一个 LinkedHashMap<String, Object>
+     */
     private static Map<String, Object> etlTraceTags(Path path, String docUuid, String userId, List<String> tags) {
+        // 为什么重要？标签最终会输出到追踪系统或日志里，稳定的顺序让对比、diff、阅读都更方便。HashMap 的顺序在不同 JVM/版本下可能不同，会造成"看起来变来变去"的假象。
+        // 统一 document. 前缀
         Map<String, Object> traceTags = new LinkedHashMap<>();
         traceTags.put("document.doc_uuid", docUuid);
         traceTags.put("document.file_name", path == null ? "" : path.getFileName());
-        traceTags.put("document.user_id", userId);
-        traceTags.put("document.tags", tags == null ? "" : String.join(",", tags));
+        traceTags.put("document.user_id", userId); // 用户 ID
+        traceTags.put("document.tags", tags == null ? "" : String.join(",", tags)); // 标签列表
         return traceTags;
     }
 
@@ -528,6 +691,13 @@ public class EtlPipeline {
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
+    /**
+     *  按 UUID 查文档（阻塞版）
+     *  这是一个非常"朴素"的同步数据库查询方法：根据 docUuid 从 MySQL 里查出对应的文档记录。
+     *  方法名里的 "Blocking" 是关键——它明确标注了这是一个阻塞操作，提醒调用方注意线程调度。
+     * @param docUuid
+     * @return
+     */
     private net.topikachu.rag.business.document.entity.Document loadDocumentByDocUuidBlocking(String docUuid) {
         if (docUuid == null || docUuid.isBlank()) {
             return null;
